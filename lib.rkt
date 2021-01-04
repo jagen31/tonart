@@ -1,113 +1,113 @@
 #lang racket/base
 
-(require tonart/core rsound rsound/piano-tones rsound/envelope
-         (for-syntax racket/base racket/dict syntax/parse
-                     racket/hash racket/match racket/format))
+(require tonart/core
+         (for-syntax rsound rsound/piano-tones rsound/envelope
+                     racket/base racket/dict syntax/parse
+                     racket/hash racket/match racket/format
+                     racket/function))
 
 (provide
-  (for-syntax translate)
-  loop
-  hole hole-object fill-hole rename-hole
-  note note->midi note->tone
-  midi t/midi
-  tone
-  quote-comp)
+  @ loop
+  fill-hole rename-hole
+  note->midi note->tone
+  perform-tone
+  perform-midi
+  play show
+  (for-syntax comp-dim))
 
-(define-for-syntax (translate comp t)
-  (for/hash ([(k v) (in-dict comp)])
-    (match k [(coord start end) (values (coord (+ start t) (+ end t)) v)])))
+(define-art-macro (@ comp c stx)
+ (syntax-parse stx
+  [(_ exprs ...)  (hash-union comp (expand-seq (hash) c (syntax-e #'(exprs ...)))
+                   #:combine append)]))
 
-;; this can be a transformer if I can get my act together re patterns
-(define-syntax quote-comp
- (syntax-parser
-  [(_ c)
-   (comp->comp*
-    (syntax-parse (local-expand #'c 'expression (list #'comp*))
-     [c*:~comp (for/comp k [e (attribute c*.comp-value)]
-                (hash k (list #''e)))]))]))
+(define-for-syntax (comp-dim comp)
+ (for/fold ([start +inf.0] [end 0] #:result (coord start end))
+           ([(k _) comp])
+  (match k [(coord start* end*) (values (min start* start) (max end* end))])))
 
-(declare-transformer (loop length expr))
-(define-transformer-instance (loop length expr)
- {=> all -> _}
- (define s (coord-start (current-coord)))
- (define len (syntax->datum length))
- (define comp* (local-expand expr 'expression (list #'comp*)))
- (syntax-parse comp*
-   [c:~comp
-    (define comp (attribute c.comp-value))
-    (match-define (coord start end) (current-coord))
-    (for/fold ([acc (hash)]
-               [prev (translate comp (- len))]
-               #:result acc)
-              ([i (in-range (floor (/ (- end start) len)))])
-      (define new (translate prev len))
-      (values (hash-union new acc #:combine append) new))]))
+(define-art-macro (loop comp c stx)
+ (syntax-parse stx
+  [(_ expr ...)
+   (match c
+    [(coord start end)
+     (for/fold ([acc comp] [i 0] #:result acc)
+               ([_ (in-naturals)])
+               #:break (>= i end)
+      (define expanded (expand-seq comp (coord i end) (syntax-e #'(expr ...))))
+      (match-define (coord _ end*) (comp-dim expanded))
+      (values (hash-union expanded acc #:combine append) end*))])]))
 
-(define-object hole [name])
-
-(declare-transformer (fill-hole n expr))
-(define-transformer-instance (fill-hole n expr)
- {=> [holes : hole] -> _}
- (for/comp c [h holes]
-   (hash c
-     (list
-      (syntax-parse #'h
-        [(_ n*) #:when (free-identifier=? #'n* n) expr]
-        [_ #'h])))))
-
-(declare-transformer (rename-hole n n*))
-(define-transformer-instance (rename-hole n n*)
- {=> [holes : hole] -> _}
- (for/comp c [h holes]
-   (hash c
-     (list
-      (syntax-parse #'h
-        [(_ n**) #:when (free-identifier=? #'n** n) #`(hole #,n*)]
-        [_ #'h])))))
-
-(define-object note [pitch accidental octave])
-(define-object midi [pitch]
- #:perform (coord start end)
- (define len (- end start))
- (rs-mult
-  (piano-tone pitch)
-  ((adsr 2 1.0 2 1.0 (round (* 1/4 len))) len)))
-(define-object tone [freq]
- #:perform (coord start end)
- (define len (- end start))
-  (rs-mult
-   (make-tone freq .2 len)
-   ((adsr 2 1.0 2 1.0 (round (* 1/4 len))) len)))
-
-(declare-transformer note->midi)
-(define-transformer-instance note->midi
- {=> [notes : note] -> midi}
- (for/comp c [e notes]
+(define-art-macro (note->midi comp c stx)
+ (for/comp c [e comp]
   (syntax-parse #'e
-   [(_ p a o)
+   [({~literal note} p a o)
     (hash c
-      (list
-       #`(midi #,(+ (syntax-parse #'p
-                     #:datum-literals [c d e f g a b]
-                     [c 0] [d 2] [e 4] [f 5] [g 7] [a 9] [b 11])
-                    (syntax->datum #'a) (* 12 (syntax->datum #'o)) 12))))])))
+     (list
+     #`(midi #,(+ (match (syntax->datum #'p)
+                   ['c 0] ['d 2] ['e 4] ['f 5] ['g 7] ['a 9] ['b 11])
+                   (syntax->datum #'a) (* 12 (syntax->datum #'o)) 12))))]
+   [e (hash c (list #'e))])))
 
-(declare-transformer note->tone)
-(define-transformer-instance note->tone
- {=> [notes : note] -> midi}
- (for/comp c [e notes]
+(define-art-macro (note->tone comp c stx)
+ (for/comp c [e comp]
   (syntax-parse #'e
-   [(_ p a o)
+   [({~literal note} p a o)
     (define semitones
      (+ (syntax-parse #'p
          #:datum-literals [c d e f g a b]
          [c 0] [d 2] [e 4] [f 5] [g 7] [a 9] [b 11])
          (syntax->datum #'a) (* 12 (syntax->datum #'o)) 12))
-    (hash c (list #`(tone #,(* 440 (expt (expt 2 1/12) (- semitones 69))))))])))
+    (hash c (list #`(tone #,(* 440 (expt (expt 2 1/12) (- semitones 69))))))]
+   [_ (hash c (list #'e))])))
 
-(declare-transformer (t/midi n))
-(define-transformer-instance (t/midi n)
- {=> [midis : midi] -> midi}
- (for/comp c [e midis]
+(define-art-macro (perform-tone comp c stx)
+ (for/comp (and c (coord (app ->frames start) (app ->frames end))) [e comp]
   (syntax-parse #'e
-   [(_ tone) (hash c (list #`(midi #,(+ (syntax->datum #'tone) (syntax->datum n)))))])))
+   [({~literal tone} hz)
+    (define len (- end start))
+    (define sound (rs-mult (make-tone (syntax->datum #'hz) .2 len) ((adsr 2 1.0 2 1.0 (round (* 1/4 len))) len)))
+    (hash c (list (syntax-property #'my-rsound 'sound sound)))]
+   [e (hash c (list #'e))])))
+
+(define-for-syntax FPS 44100)
+(define-for-syntax ->frames (compose round (curry * FPS)))
+
+(define-art-macro (perform-midi comp c stx)
+ (for/comp (and c (coord (app ->frames start) (app ->frames end))) [e comp]
+  (syntax-parse #'e
+   [({~literal midi} tone)
+    (define len (- end start))
+    (define sound (rs-mult (piano-tone (syntax->datum #'tone)) ((adsr 2 1.0 2 1.0 (round (* 1/4 len))) len)))
+    (hash c (list (syntax-property #'my-rsound 'sound sound)))]
+   [e (hash c (list #'e))])))
+
+(define-art-macro (play comp c stx)
+ (define my-pstream (make-pstream))
+ (for/comp (and c (coord (app ->frames start) (app ->frames end))) [e comp]
+  (syntax-parse #'e
+   [{~literal my-rsound}
+    (pstream-queue my-pstream (syntax-property #'e 'sound) start)
+    (hash c (list #'e))]
+   [e (hash c (list #'e))])))
+
+(define-art-macro (show comp c stx) (println comp) comp)
+
+(define-art-macro (fill-hole comp c expr)
+ (syntax-parse expr
+  [(_ n expr)
+   (for/comp c [h comp]
+    (hash c
+     (list
+      (syntax-parse #'h
+       [({~literal hole} n*) #:when (free-identifier=? #'n* #'n) #'expr]
+       [_ #'h]))))]))
+
+(define-art-macro (rename-hole comp c stx)
+ (syntax-parse stx
+  [(_ n n*)
+   (for/comp c [h comp]
+    (hash c
+     (list
+      (syntax-parse #'h
+       [({~literal hole} n**) #:when (free-identifier=? #'n** #'n) #'(hole n*)]
+       [_ #'h]))))]))
